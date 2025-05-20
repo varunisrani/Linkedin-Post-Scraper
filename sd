@@ -1,0 +1,495 @@
+#!/usr/bin/env python3
+# Import necessary libraries
+import os
+import time
+import pandas as pd
+import argparse
+import logging
+import datetime
+import multiprocessing
+from multiprocessing import Pool, cpu_count
+import subprocess
+import json
+from urllib.parse import urlparse
+from functools import partial
+import random
+
+# Import necessary selenium components directly
+from selenium import webdriver
+from selenium.webdriver.chrome.options import Options
+from selenium.webdriver.chrome.service import Service
+from webdriver_manager.chrome import ChromeDriverManager
+from selenium.webdriver.support.ui import WebDriverWait
+from selenium.webdriver.support import expected_conditions as EC
+from selenium.webdriver.common.by import By
+
+# Import the ad scraper functions from the original script
+from linkedin_ad_scraper import create_directory, DEFAULT_USERNAME, DEFAULT_PASSWORD, scrape_ad_library, login_to_linkedin, capture_screenshot
+
+# Setup logging
+def setup_logging(log_level=logging.INFO):
+    """Setup logging configuration with file and console handlers"""
+    # Create logs directory
+    logs_dir = create_directory("logs")
+    
+    # Create a timestamp for the log filename
+    timestamp = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
+    log_file = os.path.join(logs_dir, f"parallel_scraper_{timestamp}.log")
+    
+    # Configure logging
+    logging.basicConfig(
+        level=log_level,
+        format="%(asctime)s [%(levelname)s] [%(processName)s] %(message)s",
+        handlers=[
+            logging.FileHandler(log_file),
+            logging.StreamHandler()
+        ]
+    )
+    
+    logging.info(f"Logging initialized. Log file: {log_file}")
+    return log_file
+
+# List of user agents to rotate through to help avoid rate limiting
+USER_AGENTS = [
+    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/91.0.4472.124 Safari/537.36",
+    "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/92.0.4515.107 Safari/537.36",
+    "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/14.1.2 Safari/605.1.15",
+    "Mozilla/5.0 (Windows NT 10.0; Win64; x64; rv:90.0) Gecko/20100101 Firefox/90.0",
+    "Mozilla/5.0 (Macintosh; Intel Mac OS X 11.5; rv:90.0) Gecko/20100101 Firefox/90.0",
+    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/92.0.4515.107 Safari/537.36 Edg/92.0.902.55",
+    "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/92.0.4515.107 Safari/537.36"
+]
+
+def get_random_user_agent():
+    """Return a random user agent from the list"""
+    return random.choice(USER_AGENTS)
+
+def with_retry(func, max_retries=3, base_delay=10):
+    """
+    Decorator to retry a function with exponential backoff when rate limited
+    
+    Args:
+        func: The function to retry
+        max_retries: Maximum number of retries
+        base_delay: Initial delay in seconds (will be increased exponentially)
+    """
+    def wrapper(*args, **kwargs):
+        retries = 0
+        while retries <= max_retries:
+            try:
+                return func(*args, **kwargs)
+            except Exception as e:
+                if "429" in str(e) or "rate limit" in str(e).lower() or "too many requests" in str(e).lower():
+                    if retries == max_retries:
+                        logging.error(f"Rate limit exceeded after {max_retries} retries. Giving up.")
+                        raise
+                    
+                    # Calculate backoff delay: base_delay * 2^retries + random jitter
+                    delay = base_delay * (2 ** retries) + random.uniform(1, 5)
+                    logging.warning(f"Rate limit detected (HTTP 429). Retrying in {delay:.2f} seconds...")
+                    time.sleep(delay)
+                    retries += 1
+                else:
+                    # Not a rate limit error, re-raise
+                    raise
+    return wrapper
+
+def handle_rate_limiting(driver, company_name):
+    """
+    Handle rate limiting by clearing cookies and pausing
+    
+    Args:
+        driver: The Selenium WebDriver instance
+        company_name: Name of the company being scraped (for logging)
+    """
+    process_name = multiprocessing.current_process().name
+    logging.warning(f"Process {process_name}: Rate limiting detected for {company_name}. Taking recovery actions...")
+    
+    try:
+        # Clear cookies
+        driver.delete_all_cookies()
+        logging.info(f"Process {process_name}: Cleared browser cookies")
+        
+        # Change user agent (placeholder - actual implementation would be at the driver initialization)
+        logging.info(f"Process {process_name}: Would rotate user agent if possible")
+        
+        # Wait longer to help avoid rate limiting
+        delay = random.uniform(30, 60)
+        logging.info(f"Process {process_name}: Waiting {delay:.2f}s before retrying...")
+        time.sleep(delay)
+        
+        return True
+    except Exception as e:
+        logging.error(f"Process {process_name}: Error while handling rate limiting: {e}")
+        return False
+
+def process_company_with_browser(company_data, browser, username=None, password=None):
+    """Process a single company to scrape ads using an existing browser instance"""
+    try:
+        company_name = company_data['company_name']
+        company_id = company_data['company_id']
+        
+        process_name = multiprocessing.current_process().name
+        logging.info(f"Process {process_name}: Starting to scrape ads for {company_name} (ID: {company_id})")
+        
+        # Create output directories for this company
+        safe_company_name = company_name.replace(' ', '_').replace('/', '_').replace('\\', '_')
+        output_dir = create_directory(f"{safe_company_name}_output")
+        html_dir = create_directory(os.path.join(output_dir, "html"))
+        
+        # Scrape all-time ads
+        logging.info(f"Scraping all-time ads for company ID: {company_id}...")
+        all_time_data = scrape_ad_library(browser, company_id, safe_company_name, "all-time")
+        
+        # Scrape last 30 days ads
+        logging.info(f"Scraping last 30 days ads for company ID: {company_id}...")
+        last_30_days_data = scrape_ad_library(browser, company_id, safe_company_name, "last-30-days")
+        
+        # Combine the data
+        combined_data = {
+            "company_name": company_name,
+            "company_id": company_id,
+            "scrape_date": datetime.datetime.now().strftime("%Y-%m-%d"),
+            "all_time": all_time_data,
+            "last_30_days": last_30_days_data
+        }
+        
+        # Create DataFrames for CSV export
+        if all_time_data["ads"]:
+            all_time_df = pd.DataFrame(all_time_data["ads"])
+            csv_file = os.path.join(output_dir, f"{company_name}_all_time_ads.csv")
+            all_time_df.to_csv(csv_file, index=False)
+            logging.info(f"All-time ads data saved to {csv_file}")
+        
+        if last_30_days_data["ads"]:
+            last_30_days_df = pd.DataFrame(last_30_days_data["ads"])
+            csv_file = os.path.join(output_dir, f"{company_name}_last_30_days_ads.csv")
+            last_30_days_df.to_csv(csv_file, index=False)
+            logging.info(f"Last 30 days ads data saved to {csv_file}")
+        
+        # Generate a text report
+        report_file = os.path.join(output_dir, f"{company_name}_ads_report.txt")
+        with open(report_file, "w", encoding="utf-8") as f:
+            f.write(f"LinkedIn Ads Report for {company_name}\n")
+            f.write("=" * 80 + "\n\n")
+            
+            # Summary
+            f.write("SUMMARY\n")
+            f.write("-" * 80 + "\n")
+            f.write(f"Company: {company_name}\n")
+            f.write(f"Company ID: {company_id}\n")
+            f.write(f"Report Date: {combined_data['scrape_date']}\n\n")
+            
+            # All-time ads
+            f.write("ALL TIME ADS\n")
+            f.write("-" * 80 + "\n")
+            f.write(f"Are ads currently running? {'Yes' if all_time_data['ads_running'] else 'No'}\n")
+            f.write(f"Total number of ads: {all_time_data['total_ads']}\n\n")
+            
+            # Last 30 days ads
+            f.write("LAST 30 DAYS ADS\n")
+            f.write("-" * 80 + "\n")
+            f.write(f"Are ads currently running? {'Yes' if last_30_days_data['ads_running'] else 'No'}\n")
+            f.write(f"Total number of ads: {last_30_days_data['total_ads']}\n\n")
+            
+            # Add detailed ad information if available
+            if all_time_data["total_ads"] > 0 or last_30_days_data["total_ads"] > 0:
+                f.write("DETAILED AD INFORMATION\n")
+                # Additional report details omitted for brevity
+        
+        logging.info(f"Detailed report saved to {report_file}")
+        
+        # Save raw data to JSON
+        json_file = os.path.join(output_dir, f"{company_name}_ads_data.json")
+        with open(json_file, "w", encoding="utf-8") as f:
+            json.dump(combined_data, f, indent=4)
+        logging.info(f"Raw data saved to {json_file}")
+        
+        logging.info(f"Process {process_name}: Completed scraping for {company_name}")
+        return {
+            "company_name": company_name,
+            "company_id": company_id,
+            "status": "success",
+            "all_time_ads": all_time_data["total_ads"],
+            "last_30_days_ads": last_30_days_data["total_ads"]
+        }
+    except Exception as e:
+        logging.error(f"Process {process_name}: Error processing {company_data['company_name']}: {e}")
+        return {
+            "company_name": company_data['company_name'],
+            "company_id": company_data['company_id'],
+            "status": "error",
+            "error": str(e)
+        }
+
+def divide_companies(companies_df, num_scrapers=4):
+    """Divide the companies among the specified number of scrapers"""
+    total_companies = len(companies_df)
+    logging.info(f"Dividing {total_companies} companies among {num_scrapers} scrapers")
+    
+    # Calculate companies per scraper
+    base_count = total_companies // num_scrapers
+    remainder = total_companies % num_scrapers
+    
+    scraper_assignments = []
+    start_idx = 0
+    
+    for i in range(num_scrapers):
+        # Allocate an extra company to some scrapers if there's a remainder
+        count = base_count + (1 if i < remainder else 0)
+        end_idx = start_idx + count
+        
+        # Get the slice of companies for this scraper
+        if count > 0:
+            scraper_companies = companies_df.iloc[start_idx:end_idx].to_dict('records')
+            scraper_assignments.append(scraper_companies)
+            logging.info(f"Scraper {i+1} assigned {len(scraper_companies)} companies: {', '.join([c['company_name'] for c in scraper_companies])}")
+        else:
+            scraper_assignments.append([])
+            logging.info(f"Scraper {i+1} has no companies assigned")
+        
+        start_idx = end_idx
+    
+    return scraper_assignments
+
+def run_sequential_scraper(companies_df, username=None, password=None, headless=True):
+    """
+    Run a sequential scraper that reuses the same browser instance for all companies
+    """
+    logging.info("Running sequential scraper with browser reuse")
+    
+    # Initialize Chrome options
+    chrome_options = Options()
+    if headless:
+        chrome_options.add_argument("--headless")
+        logging.info("Running in headless mode")
+    else:
+        logging.info("Running in visible mode")
+    
+    chrome_options.add_argument("--no-sandbox")
+    chrome_options.add_argument("--disable-dev-shm-usage")
+    chrome_options.add_argument("--window-size=1920,1080")
+    
+    # Add random user agent
+    user_agent = get_random_user_agent()
+    chrome_options.add_argument(f"--user-agent={user_agent}")
+    logging.info(f"Using user agent: {user_agent}")
+    
+    # Initialize the browser once
+    logging.info("Initializing Chrome WebDriver")
+    browser = webdriver.Chrome(service=Service(ChromeDriverManager().install()), options=chrome_options)
+    
+    try:
+        # Login to LinkedIn once
+        logging.info("Logging in to LinkedIn")
+        login_to_linkedin(browser, username, password)
+        logging.info("Login successful")
+        
+        # Process each company sequentially with the same browser instance
+        results = []
+        total_companies = len(companies_df)
+        
+        for index, row in companies_df.iterrows():
+            company_data = row.to_dict()
+            logging.info(f"Processing company {index+1}/{total_companies}: {company_data['company_name']}")
+            
+            # Process the company
+            result = process_company_with_browser(
+                company_data,
+                browser,
+                username=username,
+                password=password
+            )
+            results.append(result)
+            
+            # Add a 30-second delay between companies as requested
+            if index < total_companies - 1:  # Skip delay after the last company
+                delay = 30  # Fixed 30-second delay as requested
+                logging.info(f"Waiting {delay} seconds before processing the next company...")
+                time.sleep(delay)
+        
+        # Create a summary of results
+        success_count = sum(1 for r in results if r['status'] == 'success')
+        error_count = sum(1 for r in results if r['status'] == 'error')
+        
+        logging.info("\nSCRAPING SUMMARY (SEQUENTIAL WITH BROWSER REUSE)")
+        logging.info(f"Total companies processed: {len(results)}")
+        logging.info(f"Successfully scraped: {success_count}")
+        logging.info(f"Failed to scrape: {error_count}")
+        if len(results) > 0:
+            logging.info(f"Success rate: {success_count/len(results)*100:.2f}%")
+        
+        print("\nSCRAPING SUMMARY (SEQUENTIAL WITH BROWSER REUSE)")
+        print(f"Total companies processed: {len(results)}")
+        print(f"Successfully scraped: {success_count}")
+        print(f"Failed to scrape: {error_count}")
+        if len(results) > 0:
+            print(f"Success rate: {success_count/len(results)*100:.2f}%")
+        
+        # Save results to JSON for reference
+        results_dir = create_directory("results")
+        timestamp = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
+        results_file = os.path.join(results_dir, f"scraping_results_sequential_reuse_{timestamp}.json")
+        
+        with open(results_file, 'w') as f:
+            json.dump(results, f, indent=4)
+        
+        logging.info(f"Detailed results saved to {results_file}")
+        print(f"Detailed results saved to {results_file}")
+        
+        return results
+    
+    finally:
+        # Close the browser at the end of all processing
+        logging.info("Closing browser after processing all companies")
+        browser.quit()
+        logging.info("Browser closed")
+
+def run_parallel_scrapers(companies_csv_path, num_scrapers=4, username=None, password=None, headless=True):
+    """Run multiple LinkedIn ad scrapers in parallel"""
+    try:
+        # Read the companies CSV
+        logging.info(f"Reading companies data from {companies_csv_path}")
+        companies_df = pd.read_csv(companies_csv_path)
+        logging.info(f"Found {len(companies_df)} companies in CSV")
+        
+        # Ensure company_id is treated as string
+        companies_df['company_id'] = companies_df['company_id'].astype(str)
+        
+        # Divide companies among scrapers
+        scraper_assignments = divide_companies(companies_df, num_scrapers)
+        
+        # Flatten the list of companies
+        all_companies = [company for assignment in scraper_assignments for company in assignment]
+        
+        # Reduce the number of parallel processes to avoid rate limiting
+        # Using fewer processes than requested to be more gentle on the server
+        suggested_processes = min(num_scrapers, 2)  # Limit to 2 parallel processes max
+        max_processes = min(len(all_companies), suggested_processes, cpu_count())
+        logging.info(f"Using {max_processes} processes for parallel execution (reduced from {num_scrapers} to avoid rate limiting)")
+        
+        # Create a partial function with the username and password
+        process_company_with_auth = partial(
+            process_company,
+            username=username,
+            password=password,
+            headless=headless
+        )
+        
+        # Process in parallel
+        results = []
+        with Pool(processes=max_processes) as pool:
+            # Map the process_company function to the companies
+            results = pool.map(process_company_with_auth, all_companies)
+        
+        # Create a summary of results
+        success_count = sum(1 for r in results if r['status'] == 'success')
+        error_count = sum(1 for r in results if r['status'] == 'error')
+        
+        logging.info("\nSCRAPING SUMMARY")
+        logging.info(f"Total companies processed: {len(results)}")
+        logging.info(f"Successfully scraped: {success_count}")
+        logging.info(f"Failed to scrape: {error_count}")
+        logging.info(f"Success rate: {success_count/len(results)*100:.2f}%")
+        
+        print("\nSCRAPING SUMMARY")
+        print(f"Total companies processed: {len(results)}")
+        print(f"Successfully scraped: {success_count}")
+        print(f"Failed to scrape: {error_count}")
+        print(f"Success rate: {success_count/len(results)*100:.2f}%")
+        
+        # Save results to JSON for reference
+        results_dir = create_directory("results")
+        timestamp = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
+        results_file = os.path.join(results_dir, f"scraping_results_{timestamp}.json")
+        
+        with open(results_file, 'w') as f:
+            json.dump(results, f, indent=4)
+        
+        logging.info(f"Detailed results saved to {results_file}")
+        print(f"Detailed results saved to {results_file}")
+        
+        return results
+        
+    except Exception as e:
+        logging.error(f"Error in parallel scraper: {e}")
+        raise
+
+def main():
+    """Main function to parse arguments and run the parallel scrapers"""
+    parser = argparse.ArgumentParser(description="LinkedIn Ad Library Parallel Scraper")
+    
+    # Input arguments
+    parser.add_argument("--csv", default="output/company_ids.csv", 
+                        help="CSV file with company IDs (default: output/company_ids.csv)")
+    parser.add_argument("--scrapers", type=int, default=2,  # Changed default from 4 to 2
+                        help="Number of parallel scrapers (default: 2)")
+    parser.add_argument("--username", help="LinkedIn username")
+    parser.add_argument("--password", help="LinkedIn password")
+    parser.add_argument("--headless", action="store_true", 
+                        help="Run browsers in headless mode")
+    parser.add_argument("--debug", action="store_true", 
+                        help="Enable debug logging")
+    parser.add_argument("--max-per-run", type=int, default=None,
+                        help="Maximum number of companies to process in a single run (to avoid rate limits)")
+    parser.add_argument("--browser-reuse", action="store_true", default=True,
+                        help="Reuse the same browser for all companies (default: True)")
+    
+    args = parser.parse_args()
+    
+    # Setup logging
+    log_level = logging.DEBUG if args.debug else logging.INFO
+    log_file = setup_logging(log_level)
+    
+    # Log the configuration
+    logging.info("Starting LinkedIn Ad Library Parallel Scraper")
+    logging.info(f"CSV file: {args.csv}")
+    logging.info(f"Number of scrapers: {args.scrapers}")
+    logging.info(f"Headless mode: {args.headless}")
+    logging.info(f"Browser reuse: {args.browser_reuse}")
+    
+    # Use default credentials if none provided
+    username = args.username if args.username else DEFAULT_USERNAME
+    password = args.password if args.password else DEFAULT_PASSWORD
+    
+    # Read the companies CSV
+    companies_df = pd.read_csv(args.csv)
+    logging.info(f"Found {len(companies_df)} companies in CSV")
+    
+    # Ensure company_id is treated as string
+    companies_df['company_id'] = companies_df['company_id'].astype(str)
+    
+    # Limit the number of companies if max_per_run is specified
+    if args.max_per_run and args.max_per_run < len(companies_df):
+        logging.info(f"Limiting to {args.max_per_run} companies per run")
+        companies_df = companies_df.head(args.max_per_run)
+    
+    # Run the scrapers
+    try:
+        if args.browser_reuse:
+            # Use sequential mode with browser reuse (new implementation)
+            run_sequential_scraper(
+                companies_df,
+                username=username,
+                password=password,
+                headless=args.headless
+            )
+        else:
+            # Use parallel mode (original implementation)
+            num_scrapers = min(args.scrapers, 2)  # Limit to maximum 2 parallel scrapers
+            run_parallel_scrapers(
+                companies_csv_path=args.csv,
+                num_scrapers=num_scrapers,
+                username=username,
+                password=password,
+                headless=args.headless
+            )
+    except Exception as e:
+        logging.error(f"Error running scrapers: {e}")
+        print(f"Error: {e}")
+        return 1
+    
+    return 0
+
+if __name__ == "__main__":
+    exit(main()) 

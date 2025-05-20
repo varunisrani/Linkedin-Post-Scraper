@@ -1,0 +1,5 @@
+Pattern found: urn:li:fsd_company:165597
+
+Context:
+id="bpr-guid-1175463">
+  {"data":{"data":{"organizationDashCompaniesByUniversalName":{"*elements":["urn:li:fsd_company:165597"],"$recipeTypes":["com.linkedin.2154e2309f3b4858a170a257892fb190"],"$type"

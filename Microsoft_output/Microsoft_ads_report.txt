@@ -1,0 +1,20 @@
+LinkedIn Ads Report for Microsoft
+================================================================================
+
+SUMMARY
+--------------------------------------------------------------------------------
+Company: Microsoft
+Company ID: 1035
+Report Date: 2025-05-11
+
+ALL TIME ADS
+--------------------------------------------------------------------------------
+Are ads currently running? Yes
+Total number of ads: 931
+
+LAST 30 DAYS ADS
+--------------------------------------------------------------------------------
+Are ads currently running? Yes
+Total number of ads: 2038
+
+DETAILED AD INFORMATION

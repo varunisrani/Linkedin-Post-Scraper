@@ -1,0 +1,32 @@
+LinkedIn Ads Report for Nike: Overview
+================================================================================
+
+SUMMARY
+--------------------------------------------------------------------------------
+Company: Nike: Overview
+Company ID: 102615782
+Report Date: 2025-05-03
+
+ALL TIME ADS
+--------------------------------------------------------------------------------
+Are ads currently running? No
+Total number of ads: 0
+
+LAST 30 DAYS ADS
+--------------------------------------------------------------------------------
+Are ads currently running? No
+Total number of ads: 0
+
+
+NO ADS FOUND
+--------------------------------------------------------------------------------
+
+No active ads were found for this company. This could be because:
+1. The company is not currently running any LinkedIn ads
+2. LinkedIn's Ad Library is not displaying ads for this company
+3. The scraper was unable to detect ads due to LinkedIn's structure
+
+Suggestions:
+- Try manually visiting the LinkedIn Ad Library for this company
+- URL: https://www.linkedin.com/ad-library/search?companyIds=102615782
+- Try searching for other companies (e.g., Goldman Sachs, ID: 1028) to verify the Ad Library functionality

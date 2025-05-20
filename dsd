@@ -1,0 +1,913 @@
+import csv
+import json
+import requests
+import sys
+import time
+import os
+import datetime
+import pandas as pd
+import re
+import argparse
+import logging
+from typing import List, Dict, Union, Optional
+from selenium import webdriver
+from selenium.webdriver.chrome.options import Options
+from selenium.webdriver.chrome.service import Service
+from webdriver_manager.chrome import ChromeDriverManager
+from selenium.webdriver.common.by import By
+from selenium.webdriver.support.ui import WebDriverWait
+from selenium.webdriver.support import expected_conditions as EC
+from selenium.common.exceptions import TimeoutException, NoSuchElementException
+
+# Google Sheets API imports
+from google.oauth2.credentials import Credentials
+from google_auth_oauthlib.flow import InstalledAppFlow
+from google.auth.transport.requests import Request
+from googleapiclient.discovery import build
+from googleapiclient.errors import HttpError
+
+# Bright Data API settings
+BRIGHT_DATA_API_TOKEN = "09aeea2d-50fc-42ec-9f2a-e3b8cfcc59be"
+PROFILE_DATASET_ID = "gd_l1viktl72bvl7bjuj0"  # Profile scraper dataset ID
+COMPANY_DATASET_ID = "gd_l1vikfnt1wgvvqz95w"  # Company scraper dataset ID - Updated to match combined scraper
+BASE_URL = "https://api.brightdata.com/datasets/v3"
+
+# LinkedIn credentials (default values)
+DEFAULT_LINKEDIN_USERNAME = "kvtvpxgaming@gmail.com"
+DEFAULT_LINKEDIN_PASSWORD = "Hello@1055"
+
+# Google API key and service account settings
+API_KEY = "AIzaSyAkpOfpjDhGbhkwfL09hQeXTDyfTPHL-rc"  # Default API key
+SERVICE_ACCOUNT_FILE = "gen-lang-client-0669898182-80f330433de5.json"
+SCOPES = ["https://www.googleapis.com/auth/spreadsheets.readonly"]
+
+def setup_logging():
+    """Configure basic logging for the script"""
+    logs_dir = create_directory("logs")
+    timestamp = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
+    log_file = os.path.join(logs_dir, f"linkedin_profile_scraper_{timestamp}.log")
+    
+    logging.basicConfig(
+        level=logging.INFO,
+        format="%(asctime)s [%(levelname)s] %(message)s",
+        handlers=[
+            logging.FileHandler(log_file),
+            logging.StreamHandler()
+        ]
+    )
+    
+    logger = logging.getLogger("linkedin_profile_scraper")
+    logger.info(f"Logging initialized. Log file: {log_file}")
+    return logger
+
+def create_directory(dir_name):
+    """Create a directory if it doesn't exist"""
+    if not os.path.exists(dir_name):
+        os.makedirs(dir_name)
+        logging.info(f"Created directory: {dir_name}")
+    return dir_name
+
+# --- Profile Data Fetcher Functions ---
+
+def read_profiles(csv_file: str) -> List[Dict[str, str]]:
+    """Read profile URLs from CSV file and format them for the API request."""
+    profiles = []
+    with open(csv_file, 'r') as f:
+        reader = csv.DictReader(f)
+        for row in reader:
+            if row['profileUrl'].strip():  # Skip empty URLs
+                profiles.append({"url": row['profileUrl'].strip()})
+    return profiles
+
+def get_google_sheets_service():
+    """Get authenticated Google Sheets service."""
+    creds = None
+    # The file token.json stores the user's access and refresh tokens, and is
+    # created automatically when the authorization flow completes for the first time.
+    if os.path.exists('token.json'):
+        creds = Credentials.from_authorized_user_file('token.json', SCOPES)
+    
+    # If there are no (valid) credentials available, let the user log in.
+    if not creds or not creds.valid:
+        if creds and creds.expired and creds.refresh_token:
+            creds.refresh(Request())
+        else:
+            flow = InstalledAppFlow.from_client_secrets_file(
+                'client_secret_793132825043-cfe1h8m6bhtlov870gn4rct8d5tkpeml.apps.googleusercontent.com.json', 
+                SCOPES
+            )
+            creds = flow.run_local_server(port=0)
+        # Save the credentials for the next run
+        with open('token.json', 'w') as token:
+            token.write(creds.to_json())
+
+    try:
+        service = build('sheets', 'v4', credentials=creds)
+        return service
+    except Exception as e:
+        logging.error(f"Error building service: {str(e)}")
+        return None
+
+def read_profiles_from_sheet(sheet_id: str) -> List[str]:
+    """Read profile URLs from Google Sheet."""
+    try:
+        service = get_google_sheets_service()
+        if not service:
+            raise Exception("Failed to create Google Sheets service")
+
+        # Call the Sheets API
+        sheet = service.spreadsheets()
+        range_name = 'Sheet1!A:Z'  # Get all columns
+        result = sheet.values().get(spreadsheetId=sheet_id, range=range_name).execute()
+        values = result.get('values', [])
+
+        if not values:
+            logging.warning('No data found in the sheet.')
+            return []
+
+        # Get headers
+        headers = values[0] if values else []
+        logging.info(f"Sheet columns: {', '.join(headers)}")
+        
+        # Find profileUrl column index
+        profile_url_col = None
+        for i, header in enumerate(headers):
+            if header.lower() == 'profileurl':
+                profile_url_col = i
+                break
+        
+        if profile_url_col is None:
+            logging.error("No 'profileUrl' column found in the sheet")
+            return []
+
+        # Extract URLs and validate
+        profile_urls = []
+        logging.info("\nProfile data from sheet:")
+        logging.info("-" * 50)
+        
+        for i, row in enumerate(values[1:], 1):
+            if len(row) > profile_url_col:  # Make sure row has enough columns
+                url = row[profile_url_col].strip()
+                
+                # Basic URL validation
+                if url and 'linkedin.com/in/' in url:
+                    profile_urls.append(url)
+                    logging.info(f"Profile {i}:")
+                    logging.info(f"  URL: {url}")
+                    
+                    # Log other available data
+                    profile_data = {headers[j]: val for j, val in enumerate(row) if j < len(headers)}
+                    for key, value in profile_data.items():
+                        if key.lower() != 'profileurl':
+                            logging.info(f"  {key}: {value}")
+                    logging.info("-" * 50)
+                else:
+                    logging.warning(f"Skipping invalid LinkedIn URL in row {i+1}: {url}")
+
+        logging.info(f"\nTotal valid profiles found: {len(profile_urls)}")
+        
+        # Format URLs for API request
+        formatted_profiles = [{"url": url} for url in profile_urls]
+        return formatted_profiles
+
+    except HttpError as err:
+        logging.error(f"Google Sheets API error: {err}")
+        return []
+    except Exception as e:
+        logging.error(f"Error reading from Google Sheet: {str(e)}")
+        return []
+
+def trigger_collection(inputs: List[Dict[str, str]], dataset_id: str = None) -> Optional[str]:
+    """Trigger a new data collection and return the snapshot ID."""
+    if dataset_id is None:
+        dataset_id = PROFILE_DATASET_ID  # Default to profile scraper
+        
+    url = f"{BASE_URL}/trigger"
+    params = {
+        "dataset_id": dataset_id,
+        "include_errors": "true"
+    }
+    headers = {
+        "Authorization": f"Bearer {BRIGHT_DATA_API_TOKEN}",
+        "Content-Type": "application/json"
+    }
+    
+    print(f"Triggering new data collection for dataset {dataset_id}...")
+    response = requests.post(url, headers=headers, params=params, json=inputs)
+    
+    if response.status_code != 200:
+        print(f"Error: Collection trigger failed with status code {response.status_code}")
+        print(f"Response: {response.text}")
+        return None
+        
+    try:
+        result = response.json()
+        snapshot_id = result.get('snapshot_id')
+        if not snapshot_id:
+            print("Error: No snapshot_id in response")
+            return None
+        print(f"Collection triggered successfully. Snapshot ID: {snapshot_id}")
+        return snapshot_id
+    except Exception as e:
+        print(f"Error parsing response: {e}")
+        return None
+
+def check_progress(snapshot_id: str) -> str:
+    """Check the progress of a collection."""
+    url = f"{BASE_URL}/progress/{snapshot_id}"
+    headers = {"Authorization": f"Bearer {BRIGHT_DATA_API_TOKEN}"}
+    
+    try:
+        response = requests.get(url, headers=headers)
+        if response.status_code != 200:
+            print(f"Error checking progress: {response.status_code}")
+            print(f"Response: {response.text}")
+            return 'failed'
+            
+        result = response.json()
+        return result.get('status', 'failed')
+    except Exception as e:
+        print(f"Error checking progress: {e}")
+        return 'failed'
+
+def wait_for_completion(snapshot_id: str, timeout: int = 300, check_interval: int = 5) -> bool:
+    """Wait for the collection to complete."""
+    start_time = time.time()
+    print("\nWaiting for data collection to complete...")
+    
+    while time.time() - start_time < timeout:
+        status = check_progress(snapshot_id)
+        
+        if status == 'ready':
+            print("Data collection completed successfully!")
+            return True
+        elif status == 'failed':
+            print("Data collection failed!")
+            return False
+        elif status == 'running':
+            print(f"Status: {status}...")
+            time.sleep(check_interval)
+        else:
+            print(f"Unknown status: {status}")
+            return False
+    
+    print("Timeout reached while waiting for completion")
+    return False
+
+def fetch_results(snapshot_id: str, format: str = 'json') -> Optional[Union[List[Dict], Dict]]:
+    """Fetch the results of a completed collection."""
+    url = f"{BASE_URL}/snapshot/{snapshot_id}"
+    headers = {"Authorization": f"Bearer {BRIGHT_DATA_API_TOKEN}"}
+    params = {"format": format}
+    
+    try:
+        print("Fetching results...")
+        response = requests.get(url, headers=headers, params=params)
+        
+        if response.status_code != 200:
+            print(f"Error fetching results: {response.status_code}")
+            print(f"Response: {response.text}")
+            return None
+            
+        return response.json()
+    except Exception as e:
+        print(f"Error fetching results: {e}")
+        return None
+
+def save_results(data: Union[List[Dict], Dict], output_file: str):
+    """Save the API response to a JSON file."""
+    with open(output_file, 'w') as f:
+        json.dump(data, f, indent=2)
+    print(f"Results saved to {output_file}")
+
+def format_company_url(url: str) -> str:
+    """Format company URL to be compatible with the API requirements."""
+    if not url or url == 'N/A':
+        return url
+        
+    # Remove tracking parameters and clean up the URL
+    url = url.split('?')[0]
+    
+    # Extract company name from URL
+    company_name = url.split('/company/')[-1] if '/company/' in url else ''
+    if company_name:
+        # Format URL to match the working pattern
+        return f"https://www.linkedin.com/company/{company_name}"
+    
+    return url
+
+def extract_company_details(profile_data: Union[List[Dict], Dict]) -> List[Dict]:
+    """Extract key company details from the profile API response and fetch company IDs."""
+    # Handle both list and single profile responses
+    profiles = profile_data if isinstance(profile_data, list) else [profile_data]
+    company_details = []
+    company_urls_map = {}  # Map to track which profile each company URL belongs to
+    
+    # First pass: Collect all company URLs and initialize company details
+    company_requests = []
+    for profile in profiles:
+        if isinstance(profile, str):
+            # Skip string entries
+            continue
+            
+        # Get current company info
+        current_company = profile.get('current_company', {})
+        company_url = current_company.get('link', 'N/A')
+        
+        # Initialize company detail with profile info
+        company_detail = {
+            'profile_name': profile.get('name', 'N/A'),
+            'profile_url': profile.get('url', 'N/A'),
+            'company_name': current_company.get('name', 'N/A'),
+            'company_url': company_url,
+            'company_id': 'N/A',  # Will be updated after company scraping
+            'location': profile.get('location', 'N/A'),
+            'followers': profile.get('followers', 'N/A'),
+            'snapshot_date': datetime.datetime.now().strftime("%Y-%m-%d")
+        }
+        
+        company_details.append(company_detail)
+        
+        # If we have a valid company URL, add it to our batch request
+        if company_url != 'N/A':
+            formatted_url = format_company_url(company_url)
+            if formatted_url != company_url:
+                logging.info(f"Reformatted company URL from {company_url} to {formatted_url}")
+            
+            company_requests.append({"url": formatted_url})
+            company_urls_map[formatted_url] = len(company_details) - 1  # Store index of company detail
+    
+    # If we have company URLs to process, make a single batch API call
+    if company_requests:
+        try:
+            logging.info(f"Making batch request for {len(company_requests)} companies")
+            
+            # Trigger collection for all companies at once
+            snapshot_id = trigger_collection(company_requests, COMPANY_DATASET_ID)
+            if snapshot_id:
+                if wait_for_completion(snapshot_id):
+                    company_results = fetch_results(snapshot_id)
+                    if company_results:
+                        # Process results and update company details
+                        results_list = company_results if isinstance(company_results, list) else [company_results]
+                        
+                        for company_data in results_list:
+                            company_url = company_data.get('url', '')
+                            if company_url in company_urls_map:
+                                # Find the corresponding company detail to update
+                                idx = company_urls_map[company_url]
+                                
+                                # Update company details with actual data
+                                company_details[idx].update({
+                                    'company_id': company_data.get('company_id', 'N/A'),
+                                    'industry': company_data.get('industries', 'N/A'),
+                                    'company_size': company_data.get('company_size', 'N/A'),
+                                    'organization_type': company_data.get('organization_type', 'N/A'),
+                                    'website': company_data.get('website', 'N/A'),
+                                    'about': company_data.get('about', 'N/A')
+                                })
+                                
+                                logging.info(f"Successfully updated data for {company_details[idx]['company_name']}")
+                            else:
+                                logging.warning(f"Could not match company data for URL: {company_url}")
+                    else:
+                        logging.warning("No company data found in batch response")
+                else:
+                    logging.warning("Batch company data collection failed or timed out")
+            else:
+                logging.warning("Failed to trigger batch company data collection")
+                
+        except Exception as e:
+            logging.error(f"Error in batch company data fetch: {e}")
+    
+    return company_details
+
+# --- Ad Count Scraper Functions ---
+
+def capture_screenshot(browser, filename):
+    """Capture a screenshot of the current page"""
+    try:
+        screenshots_dir = create_directory("screenshots")
+        filepath = os.path.join(screenshots_dir, filename)
+        browser.save_screenshot(filepath)
+        logging.info(f"Screenshot saved to {filepath}")
+        return filepath
+    except Exception as e:
+        logging.error(f"Error capturing screenshot: {e}")
+        return None
+
+def login_to_linkedin(browser, username=None, password=None, logger=None, visible_mode=False):
+    """Login to LinkedIn with the provided credentials"""
+    if logger is None:
+        logger = logging.getLogger(__name__)
+    
+    # Use default credentials if none provided
+    if username is None or password is None:
+        username = DEFAULT_LINKEDIN_USERNAME
+        password = DEFAULT_LINKEDIN_PASSWORD
+        logger.info("Using default LinkedIn credentials")
+    
+    if not username or not password:
+        logger.error("No LinkedIn credentials provided and no valid defaults found")
+        return False
+    
+    try:
+        logger.info("Logging in to LinkedIn...")
+        browser.get("https://www.linkedin.com/login")
+        logger.info("Login page loaded successfully")
+
+        # Enter username
+        username_elem = browser.find_element(By.ID, "username")
+        username_elem.send_keys(username)
+        logger.info("Username entered")
+
+        # Enter password
+        password_elem = browser.find_element(By.ID, "password")
+        password_elem.send_keys(password)
+        logger.info("Password entered")
+
+        # Click login button
+        login_button = browser.find_element(By.CSS_SELECTOR, "button[type='submit']")
+        login_button.click()
+        logger.info("Login form submitted")
+        
+        # Short delay before proceeding
+        time.sleep(2)
+        return True
+
+    except Exception as e:
+        logger.error(f"Error during login: {str(e)}")
+        capture_screenshot(browser, "login_error.png")
+        return False
+
+def get_ads_count(browser, url, logger):
+    """Extract the number of ads from a LinkedIn Ad Library page"""
+    logger.info(f"Navigating to {url}")
+    
+    try:
+        browser.get(url)
+        time.sleep(8)
+        
+        browser.execute_script("window.scrollTo(0, document.body.scrollHeight);")
+        time.sleep(2)
+        browser.execute_script("window.scrollTo(0, 0);")
+        time.sleep(2)
+        
+        screenshot_file = f"ad_library_{int(time.time())}.png"
+        screenshot_path = capture_screenshot(browser, screenshot_file)
+        logger.info(f"Screenshot saved to {screenshot_path}")
+        
+        logger.info("Waiting for ad count element to load...")
+        
+        xpath_patterns = [
+            "//div[contains(@class, 'search-results-container')]//span[contains(text(), 'ads match')]",
+            "//div[contains(@class, 'search-results')]//h2[contains(text(), 'ads match')]",
+            "//span[contains(@class, 'results-context-header')][contains(text(), 'ads match')]",
+            "//span[contains(text(), 'ads match') or contains(text(), 'ad matches')]",
+            "//div[contains(text(), 'ads match')]",
+            "//h1[contains(text(), 'ads match')]",
+            "//h2[contains(text(), 'ads match')]",
+            "//div[contains(@class, 'search-results')]//span[contains(text(), 'ads')]"
+        ]
+        
+        for xpath in xpath_patterns:
+            logger.info(f"Trying XPath: {xpath}")
+            try:
+                elements = browser.find_elements(By.XPATH, xpath)
+                if elements:
+                    logger.info(f"Found {len(elements)} potential elements")
+                    
+                    for elem in elements:
+                        text = elem.text.strip()
+                        logger.info(f"Element text: '{text}'")
+                        
+                        if text:
+                            match = re.search(r'([\d,]+)\s+ads?\s+match', text)
+                            if match:
+                                count_str = match.group(1).replace(',', '')
+                                count = int(count_str)
+                                logger.info(f"Found {count} ads from element text")
+                                return count
+            except Exception as e:
+                logger.warning(f"Error processing XPath {xpath}: {e}")
+                continue
+        
+        logger.info("Trying JavaScript to get computed text")
+        try:
+            js_script = """
+                return Array.from(document.querySelectorAll('*')).find(el => 
+                    el.textContent.match(/[\\d,]+ ads? match/)
+                )?.textContent || '';
+            """
+            text = browser.execute_script(js_script)
+            if text:
+                logger.info(f"Found text via JavaScript: {text}")
+                match = re.search(r'([\d,]+)\s+ads?\s+match', text)
+                if match:
+                    count_str = match.group(1).replace(',', '')
+                    count = int(count_str)
+                    logger.info(f"Found {count} ads from JavaScript")
+                    return count
+        except Exception as e:
+            logger.warning(f"Error executing JavaScript: {e}")
+        
+        logger.info("Checking full page source as fallback")
+        page_source = browser.page_source
+        
+        matches = re.findall(r'([\d,]+)\s+ads?\s+match', page_source)
+        if matches:
+            counts = [int(m.replace(',', '')) for m in matches]
+            count = max(counts)
+            logger.info(f"Found {count} ads in page source (largest match)")
+            return count
+        
+        if re.search(r'No ads to show|No results found', page_source, re.IGNORECASE):
+            logger.info("No ads found on this page")
+            return 0
+        
+        logger.warning("Could not find ad count on the page")
+        return None
+            
+    except Exception as e:
+        logger.error(f"Error loading {url}: {e}")
+        return None
+
+def scrape_ad_counts(company_details, browser, logger, wait_time=2):
+    """Scrape ad counts for each company"""
+    for company in company_details:
+        company_id = company.get('company_id')
+        company_name = company.get('name', 'Unknown')
+        
+        if not company_id:
+            logger.warning(f"Skipping {company_name}: No company ID available")
+            continue
+        
+        logger.info(f"Processing {company_name} (ID: {company_id})...")
+        
+        # First get all-time ads count
+        url = f"https://www.linkedin.com/ad-library/search?companyIds={company_id}"
+        logger.info(f"Navigating to {url}")
+        browser.get(url)
+        
+        # Take screenshot
+        timestamp = int(time.time())
+        screenshot_file = f"ad_library_{timestamp}.png"
+        capture_screenshot(browser, screenshot_file)
+        
+        logger.info("Waiting for ad count element to load...")
+        time.sleep(wait_time)  # Initial wait
+        
+        # Try different XPath expressions to find the ad count
+        xpath_patterns = [
+            "//div[contains(@class, 'search-results-container')]//span[contains(text(), 'ads match')]",
+            "//div[contains(@class, 'search-results')]//h2[contains(text(), 'ads match')]",
+            "//span[contains(@class, 'results-context-header')][contains(text(), 'ads match')]",
+            "//span[contains(text(), 'ads match') or contains(text(), 'ad matches')]",
+            "//div[contains(text(), 'ads match')]",
+            "//h1[contains(text(), 'ads match')]",
+            "//h2[contains(text(), 'ads match')]",
+            "//div[contains(@class, 'search-results')]//span[contains(text(), 'ads')]"
+        ]
+        
+        all_time_count = 0
+        for xpath in xpath_patterns:
+            logger.info(f"Trying XPath: {xpath}")
+            try:
+                elements = browser.find_elements(By.XPATH, xpath)
+                if elements:
+                    logger.info(f"Found {len(elements)} potential elements")
+                    for element in elements:
+                        text = element.text
+                        logger.info(f"Element text: '{text}'")
+                        if 'ads match' in text.lower() or 'ad matches' in text.lower():
+                            count = int(''.join(filter(str.isdigit, text)))
+                            logger.info(f"Found {count} ads from element text")
+                            all_time_count = count
+                            break
+                    if all_time_count > 0:
+                        break
+            except Exception as e:
+                logger.warning(f"Error with XPath '{xpath}': {str(e)}")
+                continue
+        
+        # If no count found, try JavaScript
+        if all_time_count == 0:
+            logger.info("Trying JavaScript to get computed text")
+            try:
+                elements = browser.find_elements(By.CSS_SELECTOR, '.search-results')
+                for element in elements:
+                    text = browser.execute_script("return arguments[0].textContent", element)
+                    if 'ads match' in text.lower():
+                        count = int(''.join(filter(str.isdigit, text)))
+                        all_time_count = count
+                        break
+            except Exception as e:
+                logger.warning(f"Error with JavaScript approach: {str(e)}")
+        
+        # If still no count, check page source as last resort
+        if all_time_count == 0:
+            logger.info("Checking full page source as fallback")
+            page_source = browser.page_source
+            if 'ads match' in page_source.lower():
+                matches = re.findall(r'(\d+)\s+ads?\s+match', page_source.lower())
+                if matches:
+                    all_time_count = int(matches[0])
+        
+        # Now get last 30 days count
+        url = f"https://www.linkedin.com/ad-library/search?companyIds={company_id}&dateOption=last-30-days"
+        logger.info(f"Navigating to {url}")
+        browser.get(url)
+        
+        # Take screenshot
+        timestamp = int(time.time())
+        screenshot_file = f"ad_library_{timestamp}.png"
+        capture_screenshot(browser, screenshot_file)
+        
+        logger.info("Waiting for ad count element to load...")
+        time.sleep(wait_time)
+        
+        last_30_days_count = 0
+        for xpath in xpath_patterns:
+            logger.info(f"Trying XPath: {xpath}")
+            try:
+                elements = browser.find_elements(By.XPATH, xpath)
+                if elements:
+                    logger.info(f"Found {len(elements)} potential elements")
+                    for element in elements:
+                        text = element.text
+                        logger.info(f"Element text: '{text}'")
+                        if 'ads match' in text.lower() or 'ad matches' in text.lower():
+                            count = int(''.join(filter(str.isdigit, text)))
+                            logger.info(f"Found {count} ads from element text")
+                            last_30_days_count = count
+                            break
+                    if last_30_days_count > 0:
+                        break
+            except Exception as e:
+                logger.warning(f"Error with XPath '{xpath}': {str(e)}")
+                continue
+                
+        # If no count found, try JavaScript
+        if last_30_days_count == 0:
+            logger.info("Trying JavaScript to get computed text")
+            try:
+                elements = browser.find_elements(By.CSS_SELECTOR, '.search-results')
+                for element in elements:
+                    text = browser.execute_script("return arguments[0].textContent", element)
+                    if 'ads match' in text.lower():
+                        count = int(''.join(filter(str.isdigit, text)))
+                        last_30_days_count = count
+                        break
+            except Exception as e:
+                logger.warning(f"Error with JavaScript approach: {str(e)}")
+        
+        # If still no count, check page source as last resort
+        if last_30_days_count == 0:
+            logger.info("Checking full page source as fallback")
+            page_source = browser.page_source
+            if 'ads match' in page_source.lower():
+                matches = re.findall(r'(\d+)\s+ads?\s+match', page_source.lower())
+                if matches:
+                    last_30_days_count = int(matches[0])
+            else:
+                logger.info("No ads found on this page")
+        
+        # Store the results
+        logger.info(f"  All time: {all_time_count}, Last 30 days: {last_30_days_count}")
+        print(f"{company_name} - All time: {all_time_count}, Last 30 days: {last_30_days_count}")
+        
+        company['all_time_ads'] = all_time_count
+        company['last_30_days_ads'] = last_30_days_count
+        
+        # Add a small delay between companies
+        time.sleep(wait_time)
+    
+    return company_details
+
+def update_sheet_with_ad_data(service, sheet_id: str, profile_data: List[Dict], ad_data: Dict[str, Dict], logger=None):
+    """Update Google Sheet with ad count data"""
+    if logger is None:
+        logger = logging.getLogger(__name__)
+        
+    try:
+        # Get the sheet metadata
+        sheet = service.spreadsheets().get(spreadsheetId=sheet_id).execute()
+        sheet_title = sheet['sheets'][0]['properties']['title']
+        
+        # Get existing data
+        result = service.spreadsheets().values().get(
+            spreadsheetId=sheet_id,
+            range=f"{sheet_title}!A:Z"
+        ).execute()
+        
+        existing_data = result.get('values', [])
+        if not existing_data:
+            logger.error("No data found in sheet")
+            return False
+            
+        # Find the columns for ad counts
+        header_row = existing_data[0]
+        try:
+            all_time_col = header_row.index("All Time Ads") + 1  # Convert to 1-based index
+            last_30_col = header_row.index("Last 30 Days Ads") + 1
+            company_id_col = header_row.index("Company ID") + 1
+        except ValueError:
+            # Add new columns if they don't exist
+            all_time_col = len(header_row) + 1
+            last_30_col = all_time_col + 1
+            
+            # Update header row
+            update_range = f"{sheet_title}!{chr(64+all_time_col)}1:{chr(64+last_30_col)}1"
+            service.spreadsheets().values().update(
+                spreadsheetId=sheet_id,
+                range=update_range,
+                valueInputOption="RAW",
+                body={
+                    "values": [["All Time Ads", "Last 30 Days Ads"]]
+                }
+            ).execute()
+            logger.info("Added new columns for ad counts")
+        
+        # Prepare batch updates
+        batch_updates = []
+        for row_idx, row in enumerate(existing_data[1:], start=2):  # Skip header, use 1-based index
+            try:
+                company_id = str(row[company_id_col - 1]) if len(row) >= company_id_col else None
+                if company_id and company_id in ad_data:
+                    # Update ad count cells
+                    all_time_value = ad_data[company_id]['all_time']
+                    last_30_value = ad_data[company_id]['last_30_days']
+                    
+                    batch_updates.extend([
+                        {
+                            'range': f"{sheet_title}!{chr(64+all_time_col)}{row_idx}",
+                            'values': [[all_time_value]]
+                        },
+                        {
+                            'range': f"{sheet_title}!{chr(64+last_30_col)}{row_idx}",
+                            'values': [[last_30_value]]
+                        }
+                    ])
+            except Exception as e:
+                logger.warning(f"Error processing row {row_idx}: {str(e)}")
+                continue
+        
+        # Execute batch update
+        if batch_updates:
+            body = {
+                'valueInputOption': 'RAW',
+                'data': batch_updates
+            }
+            service.spreadsheets().values().batchUpdate(
+                spreadsheetId=sheet_id,
+                body=body
+            ).execute()
+            logger.info(f"Updated {len(batch_updates)//2} rows with ad data")
+            return True
+        else:
+            logger.warning("No updates to perform")
+            return False
+            
+    except Exception as e:
+        logger.error(f"Error updating sheet: {str(e)}")
+        return False
+
+def main():
+    parser = argparse.ArgumentParser(description="LinkedIn Profile and Ad Count Scraper")
+    parser.add_argument('--sheet-id', required=True, help='Google Sheet ID containing profile URLs')
+    parser.add_argument('--output', default='profile_combined_data.csv', help='Output CSV file')
+    parser.add_argument('--intermediate', default='profile_data.json', help='Intermediate JSON file for profile data')
+    parser.add_argument('--visible', action='store_true', help='Show the browser window during execution')
+    parser.add_argument('--wait', type=int, default=2, help='Additional wait time after page load in seconds')
+    parser.add_argument('--debug', action='store_true', help='Enable debug logging')
+    args = parser.parse_args()
+
+    # Setup logging
+    logger = setup_logging()
+    logger.setLevel(logging.DEBUG if args.debug else logging.INFO)
+    logger.info("Starting LinkedIn Profile and Ad Count Scraper")
+    logger.info("Starting profile data fetch from Bright Data API")
+
+    # Read profiles from Google Sheet
+    formatted_profiles = read_profiles_from_sheet(args.sheet_id)
+    
+    if not formatted_profiles:
+        logger.error("No valid profiles found to process. Exiting.")
+        return
+
+    # Trigger collection for profiles
+    snapshot_id = trigger_collection(formatted_profiles)
+    if not snapshot_id:
+        logger.error("Failed to trigger profile collection")
+        return
+
+    # Wait for completion
+    if not wait_for_completion(snapshot_id):
+        logger.error("Profile collection failed or timed out")
+        return
+
+    # Fetch profile results
+    profile_data = fetch_results(snapshot_id)
+    if not profile_data:
+        logger.error("Failed to fetch profile results")
+        return
+
+    # Save intermediate profile data
+    save_results(profile_data, args.intermediate)
+    logger.info(f"Profile data saved to {args.intermediate}")
+
+    # Extract company details and fetch company data
+    company_details = extract_company_details(profile_data)
+    logger.info(f"Extracted details for {len(company_details)} companies")
+
+    # Setup Chrome for ad scraping
+    chrome_options = Options()
+    if not args.visible:
+        chrome_options.add_argument('--headless=new')
+    chrome_options.add_argument('--no-sandbox')
+    chrome_options.add_argument('--disable-dev-shm-usage')
+    chrome_options.add_argument('--disable-gpu')
+    chrome_options.add_argument('--disable-software-rasterizer')
+    
+    try:
+        # Simplify ChromeDriverManager initialization
+        driver_manager = ChromeDriverManager()
+        initial_driver_path = driver_manager.install()
+        logger.info(f"Initial ChromeDriver path from WebDriverManager: {initial_driver_path}")
+
+        # Correct the path if it points to the notices file or a directory
+        if initial_driver_path.endswith("THIRD_PARTY_NOTICES.chromedriver"):
+            logger.warning("WebDriverManager returned path to notices file. Adjusting to chromedriver executable.")
+            driver_path = os.path.join(os.path.dirname(initial_driver_path), "chromedriver")
+            logger.info(f"Adjusted ChromeDriver path: {driver_path}")
+        elif os.path.isdir(initial_driver_path):
+            logger.warning("WebDriverManager returned a directory. Attempting to find 'chromedriver' executable within.")
+            potential_driver_path = os.path.join(initial_driver_path, "chromedriver")
+            if os.path.exists(potential_driver_path) and not os.path.isdir(potential_driver_path):
+                driver_path = potential_driver_path
+                logger.info(f"Adjusted ChromeDriver path from directory: {driver_path}")
+            else:
+                logger.error(f"WebDriverManager returned a directory '{initial_driver_path}', but 'chromedriver' executable not found directly within.")
+                driver_path = initial_driver_path # Fallback to original, likely to fail
+        else:
+            driver_path = initial_driver_path
+
+        if not os.path.exists(driver_path) or os.path.isdir(driver_path):
+            logger.error(f"ChromeDriver executable not found or is a directory at the determined path: {driver_path}. Please check WebDriverManager installation and system PATH.")
+            raise Exception(f"ChromeDriver executable not found at {driver_path}")
+
+        logger.info(f"Using ChromeDriver executable at: {driver_path}")
+        
+        # Set executable permissions
+        os.chmod(driver_path, 0o755)
+        logger.info(f"Set execute permissions for: {driver_path}")
+        
+        # Create service with executable path
+        service = Service(executable_path=driver_path)
+        
+        # Create browser instance
+        browser = webdriver.Chrome(service=service, options=chrome_options)
+        browser.set_window_size(1920, 1080)
+        
+        try:
+            # Login to LinkedIn
+            if not login_to_linkedin(browser, logger=logger, visible_mode=args.visible):
+                logger.error("Failed to login to LinkedIn")
+                return
+
+            # Scrape ad counts
+            company_details = scrape_ad_counts(company_details, browser, logger, args.wait)
+
+            # After scraping ad counts, before saving to CSV
+            ad_data = {}
+            for company in company_details:
+                company_id = company.get('company_id')
+                if company_id:
+                    ad_data[str(company_id)] = {
+                        'all_time': company.get('all_time_ads', 0),
+                        'last_30_days': company.get('last_30_days_ads', 0)
+                    }
+            
+            # Update Google Sheet with ad data
+            logger.info("Updating Google Sheet with ad data...")
+            if update_sheet_with_ad_data(service, args.sheet_id, profile_data, ad_data, logger=logger):
+                logger.info("Successfully updated Google Sheet with ad data")
+            else:
+                logger.error("Failed to update Google Sheet with ad data")
+
+            # Save results to CSV
+            df = pd.DataFrame(company_details)
+            df.to_csv(args.output, index=False)
+            logger.info(f"Results saved to {args.output}")
+
+        finally:
+            browser.quit()
+
+    except Exception as e:
+        logger.error(f"Error setting up Chrome: {str(e)}")
+        return
+
+    logger.info("Scraping completed successfully")
+
+if __name__ == "__main__":
+    main() 
