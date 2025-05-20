@@ -82,68 +82,72 @@ Google,https://www.linkedin.com/company/google/
 - For a large number of companies, consider running fewer chunks with longer delays
 - The script creates detailed logs for troubleshooting 
 
-# LinkedIn Profile and Ad Count Scraper
+# LinkedIn Profile and Ad Count Scraper with Concurrent Processing
 
-This tool fetches LinkedIn profile data and company advertisement counts using a combination of Bright Data API and web scraping with Selenium.
+This tool fetches LinkedIn profile data and company advertisement counts using a combination of Bright Data API and web scraping with Selenium. It now supports concurrent processing to significantly speed up operations.
 
-## New Feature: Google Sheets Integration
+## New Features
 
-The script now supports fetching input data directly from Google Sheets instead of local CSV files.
+### Concurrent Processing
+- Process multiple profiles and companies simultaneously
+- Divides input URLs into smaller batches for efficient handling
+- Runs multiple Selenium instances in parallel for ad count scraping
+- Optimized for large datasets with 100+ profiles
+
+### Google Sheets Integration
+- Fetch input data directly from Google Sheets
+- Write results back with atomic updates to prevent conflicts
+- Track progress by updating specific columns
 
 ## Setup
 
 1. Install required dependencies:
    ```
-   pip install --upgrade google-api-python-client google-auth-httplib2 google-auth-oauthlib pandas selenium webdriver-manager
+   pip install --upgrade google-api-python-client google-auth-httplib2 google-auth-oauthlib pandas selenium webdriver-manager apify-client concurrent-futures
    ```
 
 2. Make sure you have the client secrets file for Google Sheets API:
-   - The file should be named `client_secret_793132825043-cfe1h8m6bhtlov870gn4rct8d5tkpeml.apps.googleusercontent.com.json`
+   - The file should be named `client_secret_<your-id>.apps.googleusercontent.com.json`
    - This file contains the credentials needed to authenticate with Google's API
 
-## Using Google Sheets as Input
+## Using with Concurrent Processing
 
 Prepare a Google Sheet with at least one column named `profileUrl` containing LinkedIn profile URLs.
 
-### Running with Google Sheets
+### Running with Concurrent Processing
 
 ```bash
-python linkedin_profile_combined_scraper.py --sheet-id YOUR_SPREADSHEET_ID --visible
+python linkedin_profile_combined_scraper.py --sheet-id YOUR_SPREADSHEET_ID --batch-size 10 --max-workers 8 --apify-token YOUR_APIFY_TOKEN
 ```
 
 Where:
-- `YOUR_SPREADSHEET_ID` is the ID from your Google Sheet URL (the long string in the middle of the URL)
-- Example: For `https://docs.google.com/spreadsheets/d/1BxiMVs0XRA5nFMdKvBdBZjgmUUqptlbs74OgvE2upms/edit`, the ID is `1BxiMVs0XRA5nFMdKvBdBZjgmUUqptlbs74OgvE2upms`
+- `YOUR_SPREADSHEET_ID` is the ID from your Google Sheet URL
+- `--batch-size` controls how many profiles to process in each batch (default: 10)
+- `--max-workers` limits the number of concurrent workers (default: 10)
+- `YOUR_APIFY_TOKEN` is your Apify platform API token
 
-### Optional Parameters
+### Concurrent Processing Parameters
 
-- `--sheet-range`: Specify the sheet and range (default: "Sheet1!A:Z")
+- `--batch-size`: Number of profiles to process in each batch (default: 10)
+- `--max-workers`: Maximum number of concurrent workers (default: 10)
+
+### Other Optional Parameters
+
+- `--sheet-id`: Google Sheet ID containing profile URLs (required)
 - `--visible`: Show the browser while scraping
 - `--wait`: Additional wait time between actions (in seconds)
-- `--skip-profile-fetch`: Skip fetching profile data and use cached JSON
-- `--skip-ad-scrape`: Skip scraping ad counts
 - `--debug`: Enable detailed logging
-- `--username` and `--password`: LinkedIn credentials
+- `--linkedin-username` and `--linkedin-password`: LinkedIn credentials
 - `--output`: Output CSV filename (default: profile_combined_data.csv)
 - `--intermediate`: Intermediate JSON file for profile data (default: profile_data.json)
+- `--company-data`: Company data JSON file (default: company_data.json)
 
-## Authentication Process
+## Performance Considerations
 
-When you run the script with Google Sheets integration for the first time:
-
-1. A browser window will open asking you to log in to your Google account
-2. Select the account that has access to the spreadsheet
-3. Grant permissions for the app to access your Google Sheets data
-4. The browser will show "The authentication flow has completed." and can be closed
-5. Your credentials will be saved to `token.json` for future use
-
-## Still Using CSV Files?
-
-You can still use CSV files with the original command:
-
-```bash
-python linkedin_profile_combined_scraper.py --input your_csv_file.csv
-```
+- For best performance, balance `batch-size` and `max-workers` based on your system resources
+- Using 8-10 workers is recommended for most systems; more workers may trigger rate limiting
+- Each worker requires a separate browser instance, so memory usage increases with worker count
+- When processing very large datasets (100+ profiles), consider using smaller batch sizes
 
 ## Output
 
@@ -154,11 +158,22 @@ The script outputs a CSV file (default: `profile_combined_data.csv`) containing:
 - Location and follower count
 - Snapshot date
 
+Additionally, all Google Sheet columns are updated with the latest data.
+
+## How Concurrent Processing Works
+
+1. Profiles are divided into batches of configurable size (default: 10)
+2. Each batch is processed by a separate worker in the thread pool
+3. Company data is fetched in parallel using multiple Bright Data API calls
+4. Ad count scraping runs multiple browser instances simultaneously
+5. Google Sheet updates are performed atomically to prevent conflicts
+
 ## Troubleshooting
 
-- If the script can't find the client secrets file, make sure it's in the same directory
-- If authentication fails, delete `token.json` and try again
+- If you encounter rate limiting, reduce the number of concurrent workers
+- Memory issues may occur with many browser instances; reduce `max-workers`
 - For LinkedIn login issues, try running with `--visible` to manually solve captchas
+- If authentication fails, delete `token.json` and try again
 
 # LinkedIn Company Data Fetcher
 
