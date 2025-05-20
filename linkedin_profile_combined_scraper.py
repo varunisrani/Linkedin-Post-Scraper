@@ -9,6 +9,7 @@ import pandas as pd
 import re
 import argparse
 import logging
+import concurrent.futures
 from typing import List, Dict, Union, Optional, Tuple
 from selenium import webdriver
 from selenium.webdriver.chrome.options import Options
@@ -23,9 +24,20 @@ from google.oauth2.service_account import Credentials
 from googleapiclient.discovery import build
 from googleapiclient.errors import HttpError
 from dotenv import load_dotenv
+import threading
+import queue
+from functools import partial
 
 # Load environment variables
 load_dotenv()
+
+# Global variables for concurrent processing
+sheet_row_indices = {}  # Maps profile URLs to row indices in Google Sheet
+li_ads_col = 0  # Column index for LI Ads? column
+days_30_col = 0  # Column index for 30 days column
+overall_col = 0  # Column index for Overall column
+thread_local = threading.local()  # Thread-local storage for browser instances
+MAX_WORKERS = 10  # Maximum number of concurrent workers
 
 # Bright Data API settings
 BRIGHT_DATA_API_TOKEN = os.getenv('BRIGHT_DATA_API_TOKEN')  # Get from environment variable
@@ -93,8 +105,18 @@ def get_google_sheets_service():
         SERVICE_ACCOUNT_FILE, scopes=SCOPES)
     return build('sheets', 'v4', credentials=creds)
 
-def read_profiles_from_sheet(sheet_id: str, service, logger=None) -> List[str]:
-    """Read LinkedIn profile URLs from Google Sheet's profileUrl column."""
+def read_profiles_from_sheet(sheet_id: str, service, batch_size=10, logger=None) -> List[List[str]]:
+    """Read LinkedIn profile URLs from Google Sheet's profileUrl column and divide into batches.
+    
+    Args:
+        sheet_id: Google Sheet ID
+        service: Google Sheets service
+        batch_size: Number of profiles to process in each batch (default: 10)
+        logger: Optional logger
+        
+    Returns:
+        List of batches, where each batch is a list of profile URLs
+    """
     if logger is None:
         logger = logging.getLogger(__name__)
         
@@ -121,18 +143,32 @@ def read_profiles_from_sheet(sheet_id: str, service, logger=None) -> List[str]:
             
         # Extract profile URLs from the correct column
         profile_urls = []
-        for row in values[1:]:  # Skip header row
+        row_indices = {}  # Store row indices for updating later
+        
+        for i, row in enumerate(values[1:], start=2):  # Skip header row, 1-indexed for Google Sheets
             if len(row) > profile_url_col:
                 url = row[profile_url_col].strip()
                 if url and 'linkedin.com/in/' in url:
                     profile_urls.append(url)
+                    row_indices[url] = i  # Store row index for this URL
                     
         if not profile_urls:
             logger.error('No valid LinkedIn profile URLs found in the profileUrl column')
             return []
             
-        logger.info(f'Found {len(profile_urls)} valid LinkedIn profile URLs')
-        return profile_urls
+        # Divide URLs into batches
+        batches = []
+        for i in range(0, len(profile_urls), batch_size):
+            batch = profile_urls[i:i+batch_size]
+            batches.append(batch)
+            
+        logger.info(f'Found {len(profile_urls)} valid LinkedIn profile URLs, divided into {len(batches)} batches of ~{batch_size} URLs each')
+        
+        # Store row indices globally for later updates
+        global sheet_row_indices
+        sheet_row_indices = row_indices
+        
+        return batches
         
     except HttpError as err:
         logger.error(f'Error reading from Google Sheet: {err}')
@@ -169,6 +205,144 @@ def scrape_linkedin_profiles(profile_urls, apify_token, logger):
     except Exception as e:
         logger.error(f"Error in Apify scraping: {str(e)}")
         return None
+
+# --- Concurrent Processing Functions ---
+
+def process_profile_batch(batch_id: int, profile_urls: List[str], apify_token: str, logger=None) -> List[Dict]:
+    """Process a batch of LinkedIn profiles concurrently.
+    
+    Args:
+        batch_id: Identifier for this batch
+        profile_urls: List of LinkedIn profile URLs to process
+        apify_token: Apify API token
+        logger: Optional logger
+        
+    Returns:
+        List of profile data dictionaries
+    """
+    if logger is None:
+        logger = logging.getLogger(__name__)
+    
+    logger.info(f"Starting batch {batch_id} with {len(profile_urls)} profiles")
+    
+    try:
+        # Scrape profiles using Apify
+        profiles_data = scrape_linkedin_profiles(profile_urls, apify_token, logger)
+        if not profiles_data:
+            logger.error(f"Batch {batch_id}: Failed to scrape profiles with Apify")
+            return []
+            
+        logger.info(f"Batch {batch_id}: Successfully scraped {len(profiles_data)} profiles")
+        return profiles_data
+            
+    except Exception as e:
+        logger.error(f"Batch {batch_id}: Error processing batch: {str(e)}")
+        return []
+
+def process_company_batch(batch_id: int, company_urls: List[Dict[str, str]], logger=None) -> List[Dict]:
+    """Process a batch of LinkedIn company URLs concurrently.
+    
+    Args:
+        batch_id: Identifier for this batch
+        company_urls: List of LinkedIn company URL dictionaries
+        logger: Optional logger
+        
+    Returns:
+        List of company data dictionaries
+    """
+    if logger is None:
+        logger = logging.getLogger(__name__)
+    
+    logger.info(f"Starting company batch {batch_id} with {len(company_urls)} companies")
+    
+    try:
+        # Trigger Bright Data collection for this batch
+        snapshot_id = trigger_collection(company_urls)
+        if not snapshot_id:
+            logger.error(f"Company batch {batch_id}: Failed to create snapshot")
+            return []
+            
+        # Wait for completion
+        if not wait_for_completion(snapshot_id):
+            logger.error(f"Company batch {batch_id}: Snapshot failed or timed out")
+            return []
+            
+        # Fetch results
+        company_data = fetch_results(snapshot_id)
+        if not company_data:
+            logger.error(f"Company batch {batch_id}: Failed to fetch data")
+            return []
+            
+        logger.info(f"Company batch {batch_id}: Successfully scraped {len(company_data)} companies")
+        return company_data
+            
+    except Exception as e:
+        logger.error(f"Company batch {batch_id}: Error processing batch: {str(e)}")
+        return []
+
+def update_sheet_batch(service, sheet_id: str, sheet_title: str, batch_data: List[Dict], logger=None) -> bool:
+    """Update Google Sheet with a batch of results.
+    
+    Args:
+        service: Google Sheets service
+        sheet_id: Google Sheet ID
+        sheet_title: Sheet title
+        batch_data: List of dictionaries with update data
+        logger: Optional logger
+        
+    Returns:
+        True if update successful, False otherwise
+    """
+    if logger is None:
+        logger = logging.getLogger(__name__)
+    
+    try:
+        # Prepare batch update
+        data = []
+        for item in batch_data:
+            profile_url = item.get('profile_url', '')
+            if profile_url in sheet_row_indices:
+                row_idx = sheet_row_indices[profile_url]
+                
+                # Add LI Ads? column update
+                li_ads = 'y' if (item.get('all_time_ads', 0) > 0 or item.get('last_30_days_ads', 0) > 0) else 'n'
+                data.append({
+                    'range': f"{sheet_title}!{chr(65+li_ads_col)}{row_idx}",
+                    'values': [[li_ads]]
+                })
+                
+                # Add 30 days column update
+                days_30 = item.get('last_30_days_ads', 0)
+                data.append({
+                    'range': f"{sheet_title}!{chr(65+days_30_col)}{row_idx}",
+                    'values': [[days_30]]
+                })
+                
+                # Add Overall column update
+                overall = item.get('all_time_ads', 0)
+                data.append({
+                    'range': f"{sheet_title}!{chr(65+overall_col)}{row_idx}",
+                    'values': [[overall]]
+                })
+        
+        if data:
+            body = {
+                'valueInputOption': 'RAW',
+                'data': data
+            }
+            service.spreadsheets().values().batchUpdate(
+                spreadsheetId=sheet_id,
+                body=body
+            ).execute()
+            logger.info(f"Updated {len(data)//3} rows with ad data")
+            return True
+        else:
+            logger.warning("No updates to perform in this batch")
+            return False
+            
+    except Exception as e:
+        logger.error(f"Error updating sheet with batch: {str(e)}")
+        return False
 
 def save_results(data, csv_file, json_file, logger):
     """Save results to both JSON and CSV files"""
@@ -1212,7 +1386,7 @@ def fetch_results(snapshot_id: str, format: str = 'json') -> Optional[Union[List
         return None
 
 def main():
-    parser = argparse.ArgumentParser(description="LinkedIn Profile and Ad Count Scraper")
+    parser = argparse.ArgumentParser(description="LinkedIn Profile and Ad Count Scraper with Parallel Processing")
     parser.add_argument('--sheet-id', required=True, help='Google Sheet ID containing profile URLs')
     parser.add_argument('--output', default='profile_combined_data.csv', help='Output CSV file')
     parser.add_argument('--intermediate', default='profile_data.json', help='Intermediate JSON file for profile data')
@@ -1223,13 +1397,20 @@ def main():
     parser.add_argument('--apify-token', required=True, help='Apify API token')
     parser.add_argument('--linkedin-username', help='LinkedIn username')
     parser.add_argument('--linkedin-password', help='LinkedIn password')
+    parser.add_argument('--batch-size', type=int, default=10, help='Number of profiles to process in each batch')
+    parser.add_argument('--max-workers', type=int, default=10, help='Maximum number of concurrent workers')
     args = parser.parse_args()
 
     # Setup logging
     logger = setup_logging()
     logger.setLevel(logging.DEBUG if args.debug else logging.INFO)
-    logger.info("Starting LinkedIn Profile and Ad Count Scraper")
-
+    logger.info("Starting LinkedIn Profile and Ad Count Scraper with Parallel Processing")
+    
+    # Set global constants
+    global MAX_WORKERS
+    MAX_WORKERS = args.max_workers
+    logger.info(f"Using maximum of {MAX_WORKERS} concurrent workers")
+    
     # Set Apify token
     global APIFY_API_TOKEN
     APIFY_API_TOKEN = args.apify_token
@@ -1240,80 +1421,106 @@ def main():
         logger.error("Failed to initialize Google Sheets service")
         return
     
-    # STEP 1: Scrape LinkedIn Profiles using Apify
-    logger.info("\n=== STEP 1: Scraping LinkedIn Profiles using Apify ===")
+    # STEP 1: Scrape LinkedIn Profiles using Apify in batches
+    logger.info("\n=== STEP 1: Scraping LinkedIn Profiles using Apify in batches ===")
     
-    # Read profiles from Google Sheet
-    profile_urls = read_profiles_from_sheet(args.sheet_id, service, logger)
-    if not profile_urls:
+    # Read profiles from Google Sheet into batches
+    profile_batches = read_profiles_from_sheet(args.sheet_id, service, args.batch_size, logger)
+    if not profile_batches:
         logger.error("No valid profiles found to process. Exiting.")
         return
 
-    logger.info(f"Found {len(profile_urls)} profiles to scrape")
-    profile_data = scrape_linkedin_profiles(profile_urls, APIFY_API_TOKEN, logger)
-    if not profile_data:
+    total_profiles = sum(len(batch) for batch in profile_batches)
+    logger.info(f"Found {total_profiles} profiles to scrape, divided into {len(profile_batches)} batches")
+    
+    # Process profile batches in parallel
+    all_profile_data = []
+    with concurrent.futures.ThreadPoolExecutor(max_workers=min(MAX_WORKERS, len(profile_batches))) as executor:
+        # Create a list of futures
+        batch_futures = {
+            executor.submit(process_profile_batch, batch_id, batch, APIFY_API_TOKEN, logger): batch_id
+            for batch_id, batch in enumerate(profile_batches)
+        }
+        
+        # Process results as they complete
+        for future in concurrent.futures.as_completed(batch_futures):
+            batch_id = batch_futures[future]
+            try:
+                batch_results = future.result()
+                logger.info(f"Batch {batch_id} completed with {len(batch_results)} profiles")
+                all_profile_data.extend(batch_results)
+            except Exception as e:
+                logger.error(f"Batch {batch_id} failed with error: {str(e)}")
+    
+    if not all_profile_data:
         logger.error("Failed to scrape profiles with Apify")
         return
-
+    
     # Save intermediate profile results
-    save_results(profile_data, args.output, args.intermediate, logger)
-    logger.info("Profile data saved successfully")
+    save_results(all_profile_data, args.output, args.intermediate, logger)
+    logger.info(f"Profile data saved successfully: {len(all_profile_data)} profiles")
 
     # STEP 2: Get Company Data using Bright Data
     logger.info("\n=== STEP 2: Getting Company Data using Bright Data ===")
     
     # Extract company URLs
-    company_urls = []
-    for profile in profile_data:
+    company_batches = []
+    batch_size = args.batch_size
+    current_batch = []
+    
+    for profile in all_profile_data:
         experiences = profile.get('experiences', [])
         if experiences and len(experiences) > 0:
             company_url = experiences[0].get('companyLink1', 'N/A')
             if company_url != 'N/A' and 'linkedin.com/company/' in company_url:
                 formatted_url = format_company_url(company_url)
-                company_urls.append({"url": formatted_url})
+                current_batch.append({"url": formatted_url})
                 logger.info(f"Added company URL: {formatted_url}")
-
-    if not company_urls:
+                
+                if len(current_batch) >= batch_size:
+                    company_batches.append(current_batch)
+                    current_batch = []
+    
+    # Add remaining companies to a final batch
+    if current_batch:
+        company_batches.append(current_batch)
+    
+    if not company_batches:
         logger.error("No valid company URLs found")
         return
-
-    # Trigger Bright Data collection
-    logger.info(f"Making batch request for {len(company_urls)} companies using Bright Data...")
-    snapshot_id = trigger_collection(company_urls)
-    if not snapshot_id:
-        logger.error("Failed to create snapshot for company data")
-        return
-
-    # Wait for snapshot with proper retry logic
-    max_retries = 10
-    retry_delay = 30  # seconds
-    company_data = None
     
-    for attempt in range(max_retries):
-        if wait_for_completion(snapshot_id):
-            logger.info("Attempting to fetch company data...")
-            try:
-                company_data = fetch_results(snapshot_id)
-                if company_data:
-                    logger.info("Successfully fetched company data")
-                    # Save company data
-                    with open(args.company_data, 'w') as f:
-                        json.dump(company_data, f, indent=2)
-                    logger.info(f"Company data saved to {args.company_data}")
-                    break
-            except Exception as e:
-                logger.warning(f"Attempt {attempt + 1}: Failed to fetch results: {str(e)}")
+    logger.info(f"Prepared {len(company_batches)} batches of company URLs for scraping")
+    
+    # Process company batches in parallel
+    all_company_data = []
+    with concurrent.futures.ThreadPoolExecutor(max_workers=min(MAX_WORKERS, len(company_batches))) as executor:
+        # Create a list of futures
+        batch_futures = {
+            executor.submit(process_company_batch, batch_id, batch, logger): batch_id
+            for batch_id, batch in enumerate(company_batches)
+        }
         
-        if attempt < max_retries - 1:
-            logger.info(f"Waiting {retry_delay} seconds before retrying...")
-            time.sleep(retry_delay)
+        # Process results as they complete
+        for future in concurrent.futures.as_completed(batch_futures):
+            batch_id = batch_futures[future]
+            try:
+                batch_results = future.result()
+                logger.info(f"Company batch {batch_id} completed with {len(batch_results)} companies")
+                all_company_data.extend(batch_results)
+            except Exception as e:
+                logger.error(f"Company batch {batch_id} failed with error: {str(e)}")
     
-    if not company_data:
-        logger.error("Failed to fetch company data after all retries")
+    # Save company data
+    with open(args.company_data, 'w') as f:
+        json.dump(all_company_data, f, indent=2)
+    logger.info(f"Company data saved to {args.company_data}")
+    
+    if not all_company_data:
+        logger.error("Failed to fetch company data")
         return
 
-    # STEP 3: Scrape Ad Counts using Chrome
-    logger.info("\n=== STEP 3: Scraping Ad Counts using Chrome ===")
+    # STEP 3: Scrape Ad Counts using Chrome with parallel processing
+    logger.info("\n=== STEP 3: Scraping Ad Counts using Chrome with parallel processing ===")
     
     # Setup Chrome
     chrome_options = Options()
@@ -1324,228 +1531,200 @@ def main():
     chrome_options.add_argument('--disable-gpu')
     chrome_options.add_argument('--disable-software-rasterizer')
     
-    try:
-        # Initialize ChromeDriver with correct path handling
-        driver_manager = ChromeDriverManager()
-        driver_path = driver_manager.install()
-        logger.info(f"Initial ChromeDriver path: {driver_path}")
-        
-        # Get the actual chromedriver executable path
-        if 'chromedriver-mac-arm64' in driver_path:
-            driver_path = os.path.join(os.path.dirname(driver_path), 'chromedriver')
-        elif 'THIRD_PARTY_NOTICES' in driver_path:
-            driver_path = os.path.join(os.path.dirname(driver_path), 'chromedriver')
-            
-        if not os.path.exists(driver_path):
-            # Try to find chromedriver in the parent directory
-            parent_dir = os.path.dirname(os.path.dirname(driver_path))
-            potential_path = os.path.join(parent_dir, 'chromedriver')
-            if os.path.exists(potential_path):
-                driver_path = potential_path
-            else:
-                raise Exception(f"ChromeDriver executable not found in {driver_path} or {potential_path}")
-        
-        logger.info(f"Using ChromeDriver executable at: {driver_path}")
-        os.chmod(driver_path, 0o755)  # Ensure executable permissions
-        
-        # Create browser instance
-        service = Service(executable_path=driver_path)
-        browser = webdriver.Chrome(service=service, options=chrome_options)
-        browser.set_window_size(1920, 1080)
+    # Process companies in batches using a thread pool
+    company_batches = []
+    for i in range(0, len(all_company_data), args.batch_size):
+        company_batches.append(all_company_data[i:i+args.batch_size])
+    
+    def process_ad_count_batch(batch, options, linkedin_username, linkedin_password, wait_time):
+        """Process a batch of companies for ad counting"""
+        local_logger = logging.getLogger(f"ad_batch_{threading.current_thread().name}")
         
         try:
-            # Login to LinkedIn
-            if not login_to_linkedin(browser, args.linkedin_username, args.linkedin_password, logger=logger):
-                logger.error("Failed to login to LinkedIn")
-                return
-
-            # Process each company
-            for company in company_data:
-                company_id = company.get('company_id')
-                company_name = company.get('name', 'Unknown')
-                
-                if not company_id:
-                    logger.warning(f"No company ID for {company_name}, skipping...")
-                    continue
-                
-                logger.info(f"\nProcessing {company_name} (ID: {company_id})")
-                
-                # Get all-time ads count
-                url = f"https://www.linkedin.com/ad-library/search?companyIds={company_id}"
-                all_time_count = get_ads_count(browser, url, logger)
-                    
-                # Get last 30 days count
-                url = f"https://www.linkedin.com/ad-library/search?companyIds={company_id}&dateOption=last-30-days"
-                last_30_count = get_ads_count(browser, url, logger)
-                
-                # Update company data
-                company['all_time_ads'] = all_time_count if all_time_count is not None else 0
-                company['last_30_days_ads'] = last_30_count if last_30_count is not None else 0
-                
-                logger.info(f"Ad counts for {company_name}:")
-                logger.info(f"  All time: {company['all_time_ads']}")
-                logger.info(f"  Last 30 days: {company['last_30_days_ads']}")
-                
-                # Small delay between companies
-                time.sleep(args.wait)
-                
-            # Save updated company data
-            with open(args.company_data, 'w') as f:
-                json.dump(company_data, f, indent=2)
-            logger.info(f"\nUpdated company data saved to {args.company_data}")
-
-            logger.info("Company data before final merge (URLs, names, and IDs):")
-            if company_data:
-                for i, comp_entry in enumerate(company_data):
-                    c_url = comp_entry.get('url', 'N/A_URL_IN_COMP_DATA')
-                    c_name = comp_entry.get('name', 'N/A_NAME_IN_COMP_DATA')
-                    c_id = comp_entry.get('company_id', 'N/A_ID_IN_COMP_DATA')
-                    # Also log the ad counts as they exist in company_data at this point
-                    c_all_ads = comp_entry.get('all_time_ads', 'N/A_ALL_ADS')
-                    c_30d_ads = comp_entry.get('last_30_days_ads', 'N/A_30D_ADS')
-                    logger.info(f"  Entry {i}: Name='{c_name}', ID='{c_id}', URL='{c_url}', FormattedURL='{format_company_url(c_url)}', AllAds='{c_all_ads}', 30dAds='{c_30d_ads}'")
-            else:
-                logger.warning("  company_data list is empty or None before final merge.")
+            # Initialize ChromeDriver
+            driver_manager = ChromeDriverManager()
+            driver_path = driver_manager.install()
+            local_logger.info(f"Using ChromeDriver at: {driver_path}")
             
-            # Create final combined data
-            combined_data = []
-            def extract_company_id_from_url(url):
-                match = re.search(r"/company/(\d+)", str(url))
-                return match.group(1) if match else None
-            for profile in profile_data:
-                profile_company_id = None
-                raw_company_link = "N/A_RAW_LINK" # For logging
-                if profile.get('experiences') and len(profile['experiences']) > 0:
-                    raw_company_link = profile['experiences'][0].get('companyLink1', 'N/A_IN_EXPERIENCE')
-                    profile_company_id = extract_company_id_from_url(raw_company_link)
-                logger.info(f"Attempting to merge for profile: '{profile.get('fullName', 'N/A_PROFILE_NAME')}'")
-                logger.info(f"  Raw companyLink1 from profile: '{raw_company_link}'")
-                logger.info(f"  Extracted profile_company_id for matching: '{profile_company_id}'")
-                company_info_for_profile = {} # Default to empty if no match
-                if profile_company_id and profile_company_id != 'N/A': # Only attempt match if profile_company_id is valid
-                    if not company_data:
-                        logger.warning("  Company data list is empty or None during merge step. Cannot find a match.")
-                    else:
-                        match_found_in_company_data = False
-                        for c_idx, company_entry in enumerate(company_data):
-                            company_data_id = str(company_entry.get('company_id', ''))
-                            logger.info(f"    Checking against company_data entry #{c_idx}: Name='{company_entry.get('name', 'N/A_COMPANY_NAME')}', ID='{company_data_id}'")
-                            if company_data_id == str(profile_company_id):
-                                company_info_for_profile = company_entry
-                                logger.info(f"  SUCCESSFUL MATCH: Profile '{profile.get('fullName', 'N/A_PROFILE_NAME')}' (ID: '{profile_company_id}')")
-                                logger.info(f"    Matched with company_data entry: Name='{company_entry.get('name', 'N/A_COMPANY_NAME')}', ID='{company_data_id}'")
-                                match_found_in_company_data = True
-                                break # Found a match, no need to check further for this profile
-                        if not match_found_in_company_data:
-                            logger.warning(f"  NO MATCH FOUND for profile '{profile.get('fullName', 'N/A_PROFILE_NAME')}' (ID: '{profile_company_id}') in {len(company_data)} company_data entries.")
-                else:
-                    logger.warning(f"  SKIPPING MATCH for profile '{profile.get('fullName', 'N/A_PROFILE_NAME')}' because its company ID is invalid or missing (Raw: '{raw_company_link}', Extracted: '{profile_company_id}').")
-                company_info = company_info_for_profile # Use the matched company_info or the default empty {}
-                combined_record = {
-                    'profile_name': profile.get('fullName', 'N/A'),
-                    'profile_url': profile.get('linkedinUrl', 'N/A'),
-                    'profile_location': profile.get('addressWithCountry', 'N/A'),
-                    'profile_headline': profile.get('headline', 'N/A'),
-                    'profile_connections': profile.get('connections', 'N/A'),
-                    'profile_followers': profile.get('followers', 'N/A'),
-                    'company_name': company_info.get('name', 'N/A'),
-                    'company_url': company_info.get('url', 'N/A'),
-                    'company_id': company_info.get('company_id', 'N/A'),
-                    'company_industry': company_info.get('industries', 'N/A'),
-                    'company_size': company_info.get('company_size', 'N/A'),
-                    'company_followers': company_info.get('followers', 'N/A'),
-                    'all_time_ads': company_info.get('all_time_ads', 0),
-                    'last_30_days_ads': company_info.get('last_30_days_ads', 0),
-                    'linkedin_ads': 'y' if (company_info.get('all_time_ads', 0) > 0 or company_info.get('last_30_days_ads', 0) > 0) else 'n',
-                    'snapshot_date': datetime.datetime.now().strftime("%Y-%m-%d")
-                }
-                combined_data.append(combined_record)
-            # Save to CSV
-            df = pd.DataFrame(combined_data)
-            df.to_csv(args.output, index=False)
-            logger.info(f"\nFinal combined results saved to {args.output}")
-
-            # --- NEW: Update ONLY the ad columns in Google Sheet ---
+            # Create browser instance
+            service = Service(executable_path=driver_path)
+            browser = webdriver.Chrome(service=service, options=options)
+            browser.set_window_size(1920, 1080)
+            
             try:
-                service = get_google_sheets_service()
-                sheet = service.spreadsheets().get(spreadsheetId=args.sheet_id).execute()
-                sheet_title = sheet['sheets'][0]['properties']['title']
-                # Get existing data
-                result = service.spreadsheets().values().get(
-                    spreadsheetId=args.sheet_id,
-                    range=f"{sheet_title}!A1:Z"
-                ).execute()
-                values = result.get('values', [])
-                if not values or len(values) < 2:
-                    logger.error('No data found in the sheet')
-                    return
-                headers = values[0]
-                # Find column indices
-                try:
-                    profile_url_col = headers.index('profileUrl')
-                    li_ads_col = headers.index('LI Ads?')
-                    days_30_col = headers.index('30 days')
-                    overall_col = headers.index('Overall')
-                except ValueError as e:
-                    logger.error(f"Required column missing: {e}")
-                    return
-                # Build a lookup from combined_data by profile_url
-                combined_lookup = {row.get('profile_url', ''): row for row in combined_data}
-                # Prepare batch update
-                data = []
-                for i, row in enumerate(values[1:], start=2):  # 1-based index, skip header
-                    if len(row) > profile_url_col:
-                        url = row[profile_url_col]
-                        if url in combined_lookup:
-                            cdata = combined_lookup[url]
-                            li_ads = 'y' if (cdata.get('all_time_ads', 0) > 0 or cdata.get('last_30_days_ads', 0) > 0) else 'n'
-                            days_30 = cdata.get('last_30_days_ads', 0)
-                            overall = cdata.get('all_time_ads', 0)
-                            # Prepare update for each column
-                            if len(row) <= li_ads_col:
-                                row += [''] * (li_ads_col - len(row) + 1)
-                            if len(row) <= days_30_col:
-                                row += [''] * (days_30_col - len(row) + 1)
-                            if len(row) <= overall_col:
-                                row += [''] * (overall_col - len(row) + 1)
-                            data.append({
-                                'range': f"{sheet_title}!{chr(65+li_ads_col)}{i}",
-                                'values': [[li_ads]]
-                            })
-                            data.append({
-                                'range': f"{sheet_title}!{chr(65+days_30_col)}{i}",
-                                'values': [[days_30]]
-                            })
-                            data.append({
-                                'range': f"{sheet_title}!{chr(65+overall_col)}{i}",
-                                'values': [[overall]]
-                            })
-                if data:
-                    body = {
-                        'valueInputOption': 'RAW',
-                        'data': data
-                    }
-                    service.spreadsheets().values().batchUpdate(
-                        spreadsheetId=args.sheet_id,
-                        body=body
-                    ).execute()
-                    logger.info(f"Updated only LI Ads?, 30 days, and Overall columns for {len(data)//3} rows.")
-                else:
-                    logger.warning("No matching profile URLs found for update.")
+                # Login to LinkedIn
+                if not login_to_linkedin(browser, linkedin_username, linkedin_password, logger=local_logger):
+                    local_logger.error("Failed to login to LinkedIn")
+                    return []
+                
+                # Process each company
+                for company in batch:
+                    company_id = company.get('company_id')
+                    company_name = company.get('name', 'Unknown')
+                    
+                    if not company_id:
+                        local_logger.warning(f"No company ID for {company_name}, skipping...")
+                        continue
+                    
+                    local_logger.info(f"Processing {company_name} (ID: {company_id})")
+                    
+                    # Get all-time ads count
+                    url = f"https://www.linkedin.com/ad-library/search?companyIds={company_id}"
+                    all_time_count = get_ads_count(browser, url, local_logger)
+                    
+                    # Get last 30 days count
+                    url = f"https://www.linkedin.com/ad-library/search?companyIds={company_id}&dateOption=last-30-days"
+                    last_30_count = get_ads_count(browser, url, local_logger)
+                    
+                    # Update company data
+                    company['all_time_ads'] = all_time_count if all_time_count is not None else 0
+                    company['last_30_days_ads'] = last_30_count if last_30_count is not None else 0
+                    
+                    local_logger.info(f"Ad counts for {company_name}:")
+                    local_logger.info(f"  All time: {company['all_time_ads']}")
+                    local_logger.info(f"  Last 30 days: {company['last_30_days_ads']}")
+                    
+                    # Small delay between companies
+                    time.sleep(wait_time)
+                
+                return batch
+                
             except Exception as e:
-                logger.error(f"Failed to update Google Sheet ad columns: {e}")
-            
+                local_logger.error(f"Error during LinkedIn ad scraping: {str(e)}")
+                return []
+            finally:
+                browser.quit()
+                
         except Exception as e:
-            logger.error(f"Error during LinkedIn scraping: {str(e)}")
-            return
-        finally:
-            browser.quit()
+            local_logger.error(f"Error in Chrome setup: {str(e)}")
+            return []
+    
+    # Process ad count batches in parallel
+    updated_company_data = []
+    with concurrent.futures.ThreadPoolExecutor(max_workers=min(MAX_WORKERS, len(company_batches))) as executor:
+        # Create a list of futures with partial function for batch processing
+        ad_count_func = partial(
+            process_ad_count_batch,
+            options=chrome_options,
+            linkedin_username=args.linkedin_username,
+            linkedin_password=args.linkedin_password,
+            wait_time=args.wait
+        )
+        
+        batch_futures = {
+            executor.submit(ad_count_func, batch): i
+            for i, batch in enumerate(company_batches)
+        }
+        
+        # Process results as they complete
+        for future in concurrent.futures.as_completed(batch_futures):
+            batch_id = batch_futures[future]
+            try:
+                batch_results = future.result()
+                logger.info(f"Ad count batch {batch_id} completed with {len(batch_results)} companies")
+                updated_company_data.extend(batch_results)
+            except Exception as e:
+                logger.error(f"Ad count batch {batch_id} failed with error: {str(e)}")
+    
+    # Save updated company data
+    with open(args.company_data, 'w') as f:
+        json.dump(updated_company_data, f, indent=2)
+    logger.info(f"\nUpdated company data saved to {args.company_data}")
+    
+    # Create final combined data
+    combined_data = []
+    def extract_company_id_from_url(url):
+        match = re.search(r"/company/(\d+)", str(url))
+        return match.group(1) if match else None
+        
+    for profile in all_profile_data:
+        profile_company_id = None
+        raw_company_link = "N/A_RAW_LINK" # For logging
+        if profile.get('experiences') and len(profile['experiences']) > 0:
+            raw_company_link = profile['experiences'][0].get('companyLink1', 'N/A_IN_EXPERIENCE')
+            profile_company_id = extract_company_id_from_url(raw_company_link)
             
-    except Exception as e:
-        logger.error(f"Error in Chrome setup/execution: {str(e)}")
-        return
+        company_info_for_profile = {} # Default to empty if no match
+        if profile_company_id and profile_company_id != 'N/A': # Only attempt match if profile_company_id is valid
+            for company_entry in updated_company_data:
+                company_data_id = str(company_entry.get('company_id', ''))
+                if company_data_id == str(profile_company_id):
+                    company_info_for_profile = company_entry
+                    logger.debug(f"Matched profile '{profile.get('fullName', 'N/A')}' with company '{company_entry.get('name', 'N/A')}'")
+                    break
+                    
+        company_info = company_info_for_profile # Use the matched company_info or the default empty {}
+        combined_record = {
+            'profile_name': profile.get('fullName', 'N/A'),
+            'profile_url': profile.get('linkedinUrl', 'N/A'),
+            'profile_location': profile.get('addressWithCountry', 'N/A'),
+            'profile_headline': profile.get('headline', 'N/A'),
+            'profile_connections': profile.get('connections', 'N/A'),
+            'profile_followers': profile.get('followers', 'N/A'),
+            'company_name': company_info.get('name', 'N/A'),
+            'company_url': company_info.get('url', 'N/A'),
+            'company_id': company_info.get('company_id', 'N/A'),
+            'company_industry': company_info.get('industries', 'N/A'),
+            'company_size': company_info.get('company_size', 'N/A'),
+            'company_followers': company_info.get('followers', 'N/A'),
+            'all_time_ads': company_info.get('all_time_ads', 0),
+            'last_30_days_ads': company_info.get('last_30_days_ads', 0),
+            'linkedin_ads': 'y' if (company_info.get('all_time_ads', 0) > 0 or company_info.get('last_30_days_ads', 0) > 0) else 'n',
+            'snapshot_date': datetime.datetime.now().strftime("%Y-%m-%d")
+        }
+        combined_data.append(combined_record)
+        
+    # Save to CSV
+    df = pd.DataFrame(combined_data)
+    df.to_csv(args.output, index=False)
+    logger.info(f"\nFinal combined results saved to {args.output}")
 
-    logger.info("\nScraping completed successfully")
+    # STEP 4: Update Google Sheet with results
+    logger.info("\n=== STEP 4: Updating Google Sheet with results ===")
+    
+    try:
+        # Get sheet metadata
+        sheet = service.spreadsheets().get(spreadsheetId=args.sheet_id).execute()
+        sheet_title = sheet['sheets'][0]['properties']['title']
+        
+        # Get existing data to find column indices
+        result = service.spreadsheets().values().get(
+            spreadsheetId=args.sheet_id,
+            range=f"{sheet_title}!A1:Z"
+        ).execute()
+        headers = result.get('values', [])[0]
+        
+        # Set global column indices
+        global li_ads_col, days_30_col, overall_col
+        try:
+            profile_url_col = headers.index('profileUrl')
+            li_ads_col = headers.index('LI Ads?')
+            days_30_col = headers.index('30 days')
+            overall_col = headers.index('Overall')
+        except ValueError as e:
+            logger.error(f"Required column missing in Google Sheet: {e}")
+            return
+            
+        # Group data for batch updates
+        batch_size = 50  # Update in smaller batches for Google Sheets API
+        update_batches = []
+        for i in range(0, len(combined_data), batch_size):
+            update_batches.append(combined_data[i:i+batch_size])
+            
+        logger.info(f"Updating Google Sheet in {len(update_batches)} batches")
+        
+        # Update sheet in batches
+        for i, batch in enumerate(update_batches):
+            logger.info(f"Updating batch {i+1}/{len(update_batches)}")
+            if update_sheet_batch(service, args.sheet_id, sheet_title, batch, logger):
+                logger.info(f"Batch {i+1} updated successfully")
+            else:
+                logger.error(f"Failed to update batch {i+1}")
+                
+    except Exception as e:
+        logger.error(f"Failed to update Google Sheet: {str(e)}")
+        
+    logger.info("\nScraping and updates completed successfully")
 
 if __name__ == "__main__":
     main() 
